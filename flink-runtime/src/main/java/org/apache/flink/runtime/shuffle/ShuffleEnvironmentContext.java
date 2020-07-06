@@ -19,12 +19,13 @@
 package org.apache.flink.runtime.shuffle;
 
 import org.apache.flink.configuration.Configuration;
+import org.apache.flink.configuration.MemorySize;
 import org.apache.flink.metrics.MetricGroup;
 import org.apache.flink.runtime.clusterframework.types.ResourceID;
-import org.apache.flink.runtime.io.disk.iomanager.IOManager;
 import org.apache.flink.runtime.io.network.TaskEventPublisher;
 
 import java.net.InetAddress;
+import java.util.concurrent.Executor;
 
 import static org.apache.flink.util.Preconditions.checkNotNull;
 
@@ -33,43 +34,44 @@ import static org.apache.flink.util.Preconditions.checkNotNull;
  */
 public class ShuffleEnvironmentContext {
 	private final Configuration configuration;
-	private final ResourceID location;
-	private final long maxJvmHeapMemory;
+	private final ResourceID taskExecutorResourceId;
+	private final MemorySize networkMemorySize;
 	private final boolean localCommunicationOnly;
 	private final InetAddress hostAddress;
 	private final TaskEventPublisher eventPublisher;
 	private final MetricGroup parentMetricGroup;
-	private final IOManager ioManager;
+
+	private final Executor ioExecutor;
 
 	public ShuffleEnvironmentContext(
 			Configuration configuration,
-			ResourceID location,
-			long maxJvmHeapMemory,
+			ResourceID taskExecutorResourceId,
+			MemorySize networkMemorySize,
 			boolean localCommunicationOnly,
 			InetAddress hostAddress,
 			TaskEventPublisher eventPublisher,
 			MetricGroup parentMetricGroup,
-			IOManager ioManager) {
+			Executor ioExecutor) {
 		this.configuration = checkNotNull(configuration);
-		this.location = checkNotNull(location);
-		this.maxJvmHeapMemory = maxJvmHeapMemory;
+		this.taskExecutorResourceId = checkNotNull(taskExecutorResourceId);
+		this.networkMemorySize = networkMemorySize;
 		this.localCommunicationOnly = localCommunicationOnly;
 		this.hostAddress = checkNotNull(hostAddress);
 		this.eventPublisher = checkNotNull(eventPublisher);
 		this.parentMetricGroup = checkNotNull(parentMetricGroup);
-		this.ioManager = checkNotNull(ioManager);
+		this.ioExecutor = ioExecutor;
 	}
 
 	public Configuration getConfiguration() {
 		return configuration;
 	}
 
-	public ResourceID getLocation() {
-		return location;
+	public ResourceID getTaskExecutorResourceId() {
+		return taskExecutorResourceId;
 	}
 
-	public long getMaxJvmHeapMemory() {
-		return maxJvmHeapMemory;
+	public MemorySize getNetworkMemorySize() {
+		return networkMemorySize;
 	}
 
 	public boolean isLocalCommunicationOnly() {
@@ -88,7 +90,7 @@ public class ShuffleEnvironmentContext {
 		return parentMetricGroup;
 	}
 
-	public IOManager getIOManager() {
-		return ioManager;
+	public Executor getIoExecutor() {
+		return ioExecutor;
 	}
 }

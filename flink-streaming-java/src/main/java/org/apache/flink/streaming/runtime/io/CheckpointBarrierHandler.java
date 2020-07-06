@@ -18,52 +18,128 @@
 
 package org.apache.flink.streaming.runtime.io;
 
-import org.apache.flink.annotation.Internal;
-import org.apache.flink.runtime.io.AsyncDataInput;
-import org.apache.flink.runtime.io.network.partition.consumer.BufferOrEvent;
+import org.apache.flink.runtime.checkpoint.CheckpointException;
+import org.apache.flink.runtime.checkpoint.CheckpointFailureReason;
+import org.apache.flink.runtime.checkpoint.CheckpointMetaData;
+import org.apache.flink.runtime.checkpoint.CheckpointMetrics;
+import org.apache.flink.runtime.checkpoint.channel.InputChannelInfo;
+import org.apache.flink.runtime.io.network.api.CancelCheckpointMarker;
+import org.apache.flink.runtime.io.network.api.CheckpointBarrier;
+import org.apache.flink.runtime.io.network.buffer.BufferReceivedListener;
 import org.apache.flink.runtime.jobgraph.tasks.AbstractInvokable;
+import org.apache.flink.util.function.ThrowingRunnable;
 
+import java.io.Closeable;
 import java.io.IOException;
+import java.util.Optional;
+import java.util.concurrent.CompletableFuture;
+
+import static org.apache.flink.util.Preconditions.checkNotNull;
 
 /**
- * The CheckpointBarrierHandler reacts to checkpoint barrier arriving from the input channels.
+ * The {@link CheckpointBarrierHandler} reacts to checkpoint barrier arriving from the input channels.
  * Different implementations may either simply track barriers, or block certain inputs on
  * barriers.
  */
-@Internal
-public interface CheckpointBarrierHandler extends AsyncDataInput<BufferOrEvent> {
+public abstract class CheckpointBarrierHandler implements Closeable {
+
+	/** The listener to be notified on complete checkpoints. */
+	private final AbstractInvokable toNotifyOnCheckpoint;
+
+	private long latestCheckpointStartDelayNanos;
+
+	public CheckpointBarrierHandler(AbstractInvokable toNotifyOnCheckpoint) {
+		this.toNotifyOnCheckpoint = checkNotNull(toNotifyOnCheckpoint);
+	}
+
+	public void releaseBlocksAndResetBarriers() throws IOException {
+	}
 
 	/**
-	 * Registers the task be notified once all checkpoint barriers have been received for a checkpoint.
+	 * Checks whether the channel with the given index is blocked.
 	 *
-	 * @param task The task to notify
+	 * @param channelInfo The channel index to check.
+	 * @return True if the channel is blocked, false if not.
 	 */
-	void registerCheckpointEventHandler(AbstractInvokable task);
+	public boolean isBlocked(InputChannelInfo channelInfo) {
+		return false;
+	}
+
+	@Override
+	public void close() throws IOException {
+	}
+
+	public abstract void processBarrier(CheckpointBarrier receivedBarrier, InputChannelInfo channelInfo) throws Exception;
+
+	public abstract void processCancellationBarrier(CancelCheckpointMarker cancelBarrier) throws Exception;
+
+	public abstract void processEndOfPartition() throws Exception;
+
+	public abstract long getLatestCheckpointId();
+
+	public long getAlignmentDurationNanos() {
+		return 0;
+	}
+
+	public long getCheckpointStartDelayNanos() {
+		return latestCheckpointStartDelayNanos;
+	}
+
+	public Optional<BufferReceivedListener> getBufferReceivedListener() {
+		return Optional.empty();
+	}
 
 	/**
-	 * Cleans up all internally held resources.
-	 *
-	 * @throws IOException Thrown if the cleanup of I/O resources failed.
+	 * Returns true if there is in-flight data in the buffers for the given channel and checkpoint. More specifically,
+	 * this method returns true iff the unaligner still expects the respective barrier to be <i>consumed</i> on the
+	 * that channel.
 	 */
-	void cleanup() throws IOException;
+	public boolean hasInflightData(long checkpointId, InputChannelInfo channelInfo) {
+		return false;
+	}
 
-	/**
-	 * Checks if the barrier handler has buffered any data internally.
-	 * @return {@code True}, if no data is buffered internally, {@code false} otherwise.
-	 */
-	boolean isEmpty();
+	public CompletableFuture<Void> getAllBarriersReceivedFuture(long checkpointId) {
+		return CompletableFuture.completedFuture(null);
+	}
 
-	/**
-	 * Gets the time that the latest alignment took, in nanoseconds.
-	 * If there is currently an alignment in progress, it will return the time spent in the
-	 * current alignment so far.
-	 *
-	 * @return The duration in nanoseconds
-	 */
-	long getAlignmentDurationNanos();
+	protected void notifyCheckpoint(CheckpointBarrier checkpointBarrier, long alignmentDurationNanos) throws IOException {
+		CheckpointMetaData checkpointMetaData =
+			new CheckpointMetaData(checkpointBarrier.getId(), checkpointBarrier.getTimestamp());
 
-	/**
-	 * @return number of underlying input channels.
-	 */
-	int getNumberOfInputChannels();
+		CheckpointMetrics checkpointMetrics = new CheckpointMetrics()
+			.setAlignmentDurationNanos(alignmentDurationNanos)
+			.setCheckpointStartDelayNanos(latestCheckpointStartDelayNanos);
+
+		toNotifyOnCheckpoint.triggerCheckpointOnBarrier(
+			checkpointMetaData,
+			checkpointBarrier.getCheckpointOptions(),
+			checkpointMetrics);
+	}
+
+	protected void notifyAbortOnCancellationBarrier(long checkpointId) throws IOException {
+		notifyAbort(checkpointId,
+			new CheckpointException(CheckpointFailureReason.CHECKPOINT_DECLINED_ON_CANCELLATION_BARRIER));
+	}
+
+	protected void notifyAbort(long checkpointId, CheckpointException cause) throws IOException {
+		toNotifyOnCheckpoint.abortCheckpointOnBarrier(checkpointId, cause);
+	}
+
+	protected void markCheckpointStart(long checkpointCreationTimestamp) {
+		latestCheckpointStartDelayNanos = 1_000_000 * Math.max(
+			0,
+			System.currentTimeMillis() - checkpointCreationTimestamp);
+	}
+
+	protected <E extends Exception> void executeInTaskThread(
+			ThrowingRunnable<E> runnable,
+			String descriptionFormat,
+			Object... descriptionArgs) throws E {
+		toNotifyOnCheckpoint.executeInTaskThread(runnable, descriptionFormat, descriptionArgs);
+	}
+
+	protected abstract boolean isCheckpointPending();
+
+	protected void abortPendingCheckpoint(long checkpointId, CheckpointException exception) throws IOException {
+	}
 }

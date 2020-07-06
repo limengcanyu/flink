@@ -21,8 +21,8 @@ import shutil
 import sys
 import tempfile
 
-from pyflink.table import TableEnvironment, TableConfig, FileSystem, OldCsv, Schema
-from pyflink.table.types import DataTypes
+from pyflink.dataset import ExecutionEnvironment
+from pyflink.table import BatchTableEnvironment, TableConfig
 
 
 def word_count():
@@ -34,8 +34,9 @@ def word_count():
               "License you may not use this file except in compliance " \
               "with the License"
 
-    t_config = TableConfig.Builder().as_batch_execution().build()
-    t_env = TableEnvironment.create(t_config)
+    t_config = TableConfig()
+    env = ExecutionEnvironment.get_execution_environment()
+    t_env = BatchTableEnvironment.create(env, t_config)
 
     # register Results table in table environment
     tmp_dir = tempfile.gettempdir()
@@ -51,15 +52,17 @@ def word_count():
 
     logging.info("Results directory: %s", result_path)
 
-    t_env.connect(FileSystem().path(result_path)) \
-        .with_format(OldCsv()
-                     .field_delimiter(',')
-                     .field("word", DataTypes.STRING())
-                     .field("count", DataTypes.BIGINT())) \
-        .with_schema(Schema()
-                     .field("word", DataTypes.STRING())
-                     .field("count", DataTypes.BIGINT())) \
-        .register_table_sink("Results")
+    sink_ddl = """
+        create table Results(
+            word VARCHAR,
+            `count` BIGINT
+        ) with (
+            'connector.type' = 'filesystem',
+            'format.type' = 'csv',
+            'connector.path' = '{}'
+        )
+        """.format(result_path)
+    t_env.sql_update(sink_ddl)
 
     elements = [(word, 1) for word in content.split(" ")]
     t_env.from_elements(elements, ["word", "count"]) \
@@ -67,7 +70,7 @@ def word_count():
          .select("word, count(1) as count") \
          .insert_into("Results")
 
-    t_env.execute()
+    t_env.execute("word_count")
 
 
 if __name__ == '__main__':

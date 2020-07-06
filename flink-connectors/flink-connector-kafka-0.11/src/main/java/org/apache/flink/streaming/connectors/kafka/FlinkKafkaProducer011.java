@@ -20,6 +20,7 @@ package org.apache.flink.streaming.connectors.kafka;
 import org.apache.flink.annotation.Internal;
 import org.apache.flink.annotation.PublicEvolving;
 import org.apache.flink.annotation.VisibleForTesting;
+import org.apache.flink.api.common.ExecutionConfig;
 import org.apache.flink.api.common.functions.RuntimeContext;
 import org.apache.flink.api.common.serialization.SerializationSchema;
 import org.apache.flink.api.common.state.ListState;
@@ -43,7 +44,6 @@ import org.apache.flink.streaming.connectors.kafka.internal.TransactionalIdsGene
 import org.apache.flink.streaming.connectors.kafka.internal.metrics.KafkaMetricMutableWrapper;
 import org.apache.flink.streaming.connectors.kafka.internals.KeyedSerializationSchemaWrapper;
 import org.apache.flink.streaming.connectors.kafka.partitioner.FlinkFixedPartitioner;
-import org.apache.flink.streaming.connectors.kafka.partitioner.FlinkKafkaDelegatePartitioner;
 import org.apache.flink.streaming.connectors.kafka.partitioner.FlinkKafkaPartitioner;
 import org.apache.flink.streaming.util.serialization.KeyedSerializationSchema;
 import org.apache.flink.util.ExceptionUtils;
@@ -83,6 +83,7 @@ import java.util.Properties;
 import java.util.Set;
 import java.util.concurrent.BlockingDeque;
 import java.util.concurrent.LinkedBlockingDeque;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicLong;
 
 import static org.apache.flink.util.Preconditions.checkNotNull;
@@ -496,7 +497,7 @@ public class FlinkKafkaProducer011<IN>
 		this.kafkaProducersPoolSize = kafkaProducersPoolSize;
 		checkState(kafkaProducersPoolSize > 0, "kafkaProducersPoolSize must be non empty");
 
-		ClosureCleaner.clean(this.flinkKafkaPartitioner, true);
+		ClosureCleaner.clean(this.flinkKafkaPartitioner, ExecutionConfig.ClosureCleanerLevel.RECURSIVE, true);
 		ClosureCleaner.ensureSerializable(serializationSchema);
 
 		// set the producer configuration properties for kafka record key value serializers.
@@ -615,6 +616,11 @@ public class FlinkKafkaProducer011<IN>
 			};
 		}
 
+		if (schema instanceof KeyedSerializationSchemaWrapper) {
+			((KeyedSerializationSchemaWrapper<IN>) schema).getSerializationSchema()
+				.open(() -> getRuntimeContext().getMetricGroup().addGroup("user"));
+		}
+
 		super.open(configuration);
 	}
 
@@ -670,7 +676,8 @@ public class FlinkKafkaProducer011<IN>
 						break;
 					case AT_LEAST_ONCE:
 					case NONE:
-						currentTransaction.producer.close();
+						currentTransaction.producer.flush();
+						currentTransaction.producer.close(0, TimeUnit.SECONDS);
 						break;
 				}
 			}
@@ -881,20 +888,26 @@ public class FlinkKafkaProducer011<IN>
 	}
 
 	@Override
-	protected void finishRecoveringContext() {
-		cleanUpUserContext();
+	protected void finishRecoveringContext(Collection<FlinkKafkaProducer011.KafkaTransactionState> handledTransactions) {
+		cleanUpUserContext(handledTransactions);
 		resetAvailableTransactionalIdsPool(getUserContext().get().transactionalIds);
 		LOG.info("Recovered transactionalIds {}", getUserContext().get().transactionalIds);
 	}
 
 	/**
 	 * After initialization make sure that all previous transactions from the current user context have been completed.
+	 *
+	 * @param handledTransactions
+	 * 		transactions which were already committed or aborted and do not need further handling
 	 */
-	private void cleanUpUserContext() {
+	private void cleanUpUserContext(Collection<KafkaTransactionState> handledTransactions) {
 		if (!getUserContext().isPresent()) {
 			return;
 		}
-		abortTransactions(getUserContext().get().transactionalIds);
+		HashSet<String> abortTransactions = new HashSet<>(getUserContext().get().transactionalIds);
+		handledTransactions.forEach(
+			kafkaTransactionState -> abortTransactions.remove(kafkaTransactionState.transactionalId));
+		abortTransactions(abortTransactions);
 	}
 
 	private void resetAvailableTransactionalIdsPool(Collection<String> transactionalIds) {
@@ -905,13 +918,20 @@ public class FlinkKafkaProducer011<IN>
 	// ----------------------------------- Utilities --------------------------
 
 	private void abortTransactions(Set<String> transactionalIds) {
-		for (String transactionalId : transactionalIds) {
+		transactionalIds.parallelStream().forEach(transactionalId -> {
+			// don't mess with the original configuration or any other properties of the
+			// original object
+			// -> create an internal kafka producer on our own and do not rely on
+			//    initTransactionalProducer().
+			final Properties myConfig = new Properties();
+			myConfig.putAll(producerConfig);
+			initTransactionalProducerConfig(myConfig, transactionalId);
 			try (FlinkKafkaProducer<byte[], byte[]> kafkaProducer =
-					initTransactionalProducer(transactionalId, false)) {
-				// it suffice to call initTransactions - this will abort any lingering transactions
+					new FlinkKafkaProducer<>(myConfig)) {
+				// it suffices to call initTransactions - this will abort any lingering transactions
 				kafkaProducer.initTransactions();
 			}
-		}
+		});
 	}
 
 	int getTransactionCoordinatorId() {
@@ -941,16 +961,21 @@ public class FlinkKafkaProducer011<IN>
 
 	private void recycleTransactionalProducer(FlinkKafkaProducer<byte[], byte[]> producer) {
 		availableTransactionalIds.add(producer.getTransactionalId());
-		producer.close();
+		producer.flush();
+		producer.close(0, TimeUnit.SECONDS);
 	}
 
 	private FlinkKafkaProducer<byte[], byte[]> initTransactionalProducer(String transactionalId, boolean registerMetrics) {
-		producerConfig.put("transactional.id", transactionalId);
+		initTransactionalProducerConfig(producerConfig, transactionalId);
 		return initProducer(registerMetrics);
 	}
 
+	private static void initTransactionalProducerConfig(Properties producerConfig, String transactionalId) {
+		producerConfig.put(ProducerConfig.TRANSACTIONAL_ID_CONFIG, transactionalId);
+	}
+
 	private FlinkKafkaProducer<byte[], byte[]> initNonTransactionalProducer(boolean registerMetrics) {
-		producerConfig.remove("transactional.id");
+		producerConfig.remove(ProducerConfig.TRANSACTIONAL_ID_CONFIG);
 		return initProducer(registerMetrics);
 	}
 
@@ -960,10 +985,6 @@ public class FlinkKafkaProducer011<IN>
 		RuntimeContext ctx = getRuntimeContext();
 
 		if (flinkKafkaPartitioner != null) {
-			if (flinkKafkaPartitioner instanceof FlinkKafkaDelegatePartitioner) {
-				((FlinkKafkaDelegatePartitioner) flinkKafkaPartitioner).setPartitions(
-					getPartitionsByTopic(this.defaultTopicId, producer));
-			}
 			flinkKafkaPartitioner.open(ctx.getIndexOfThisSubtask(), ctx.getNumberOfParallelSubtasks());
 		}
 
@@ -1065,7 +1086,7 @@ public class FlinkKafkaProducer011<IN>
 	 */
 	@VisibleForTesting
 	@Internal
-	static class KafkaTransactionState {
+	public static class KafkaTransactionState {
 
 		private final transient FlinkKafkaProducer<byte[], byte[]> producer;
 
@@ -1076,15 +1097,21 @@ public class FlinkKafkaProducer011<IN>
 
 		final short epoch;
 
-		KafkaTransactionState(String transactionalId, FlinkKafkaProducer<byte[], byte[]> producer) {
+		@VisibleForTesting
+		@Internal
+		public KafkaTransactionState(String transactionalId, FlinkKafkaProducer<byte[], byte[]> producer) {
 			this(transactionalId, producer.getProducerId(), producer.getEpoch(), producer);
 		}
 
-		KafkaTransactionState(FlinkKafkaProducer<byte[], byte[]> producer) {
+		@VisibleForTesting
+		@Internal
+		public KafkaTransactionState(FlinkKafkaProducer<byte[], byte[]> producer) {
 			this(null, -1, (short) -1, producer);
 		}
 
-		KafkaTransactionState(
+		@VisibleForTesting
+		@Internal
+		public KafkaTransactionState(
 				@Nullable String transactionalId,
 				long producerId,
 				short epoch,
@@ -1147,7 +1174,9 @@ public class FlinkKafkaProducer011<IN>
 	public static class KafkaTransactionContext {
 		final Set<String> transactionalIds;
 
-		KafkaTransactionContext(Set<String> transactionalIds) {
+		@VisibleForTesting
+		@Internal
+		public KafkaTransactionContext(Set<String> transactionalIds) {
 			checkNotNull(transactionalIds);
 			this.transactionalIds = transactionalIds;
 		}

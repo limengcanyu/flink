@@ -18,10 +18,12 @@
 
 package org.apache.flink.runtime.io.network.partition;
 
+import org.apache.flink.runtime.checkpoint.channel.ChannelStateReader;
 import org.apache.flink.runtime.executiongraph.IntermediateResultPartition;
 import org.apache.flink.runtime.io.network.api.writer.ResultPartitionWriter;
 import org.apache.flink.runtime.io.network.buffer.Buffer;
 import org.apache.flink.runtime.io.network.buffer.BufferBuilder;
+import org.apache.flink.runtime.io.network.buffer.BufferCompressor;
 import org.apache.flink.runtime.io.network.buffer.BufferConsumer;
 import org.apache.flink.runtime.io.network.buffer.BufferPool;
 import org.apache.flink.runtime.io.network.buffer.BufferPoolOwner;
@@ -29,6 +31,7 @@ import org.apache.flink.runtime.io.network.partition.consumer.LocalInputChannel;
 import org.apache.flink.runtime.io.network.partition.consumer.RemoteInputChannel;
 import org.apache.flink.runtime.jobgraph.DistributionPattern;
 import org.apache.flink.runtime.taskexecutor.TaskExecutor;
+import org.apache.flink.util.Preconditions;
 import org.apache.flink.util.function.FunctionWithException;
 
 import org.slf4j.Logger;
@@ -37,8 +40,8 @@ import org.slf4j.LoggerFactory;
 import javax.annotation.Nullable;
 
 import java.io.IOException;
+import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.atomic.AtomicBoolean;
-import java.util.concurrent.atomic.AtomicInteger;
 
 import static org.apache.flink.util.Preconditions.checkArgument;
 import static org.apache.flink.util.Preconditions.checkElementIndex;
@@ -71,32 +74,27 @@ import static org.apache.flink.util.Preconditions.checkState;
  */
 public class ResultPartition implements ResultPartitionWriter, BufferPoolOwner {
 
-	private static final Logger LOG = LoggerFactory.getLogger(ResultPartition.class);
+	protected static final Logger LOG = LoggerFactory.getLogger(ResultPartition.class);
 
 	private final String owningTaskName;
 
-	private final ResultPartitionID partitionId;
+	private final int partitionIndex;
+
+	protected final ResultPartitionID partitionId;
 
 	/** Type of this partition. Defines the concrete subpartition implementation to use. */
-	private final ResultPartitionType partitionType;
+	protected final ResultPartitionType partitionType;
 
 	/** The subpartitions of this partition. At least one. */
-	private final ResultSubpartition[] subpartitions;
+	protected final ResultSubpartition[] subpartitions;
 
-	private final ResultPartitionManager partitionManager;
+	protected final ResultPartitionManager partitionManager;
 
 	public final int numTargetKeyGroups;
 
 	// - Runtime state --------------------------------------------------------
 
 	private final AtomicBoolean isReleased = new AtomicBoolean();
-
-	/**
-	 * The total number of references to subpartitions of this result. The result partition can be
-	 * safely released, iff the reference count is zero. A reference count of -1 denotes that the
-	 * result partition has been released.
-	 */
-	private final AtomicInteger pendingReferences = new AtomicInteger();
 
 	private BufferPool bufferPool;
 
@@ -106,21 +104,30 @@ public class ResultPartition implements ResultPartitionWriter, BufferPoolOwner {
 
 	private final FunctionWithException<BufferPoolOwner, BufferPool, IOException> bufferPoolFactory;
 
+	/** Used to compress buffer to reduce IO. */
+	@Nullable
+	protected final BufferCompressor bufferCompressor;
+
 	public ResultPartition(
 		String owningTaskName,
+		int partitionIndex,
 		ResultPartitionID partitionId,
 		ResultPartitionType partitionType,
 		ResultSubpartition[] subpartitions,
 		int numTargetKeyGroups,
 		ResultPartitionManager partitionManager,
+		@Nullable BufferCompressor bufferCompressor,
 		FunctionWithException<BufferPoolOwner, BufferPool, IOException> bufferPoolFactory) {
 
 		this.owningTaskName = checkNotNull(owningTaskName);
+		Preconditions.checkArgument(0 <= partitionIndex, "The partition index must be positive.");
+		this.partitionIndex = partitionIndex;
 		this.partitionId = checkNotNull(partitionId);
 		this.partitionType = checkNotNull(partitionType);
 		this.subpartitions = checkNotNull(subpartitions);
 		this.numTargetKeyGroups = numTargetKeyGroups;
 		this.partitionManager = checkNotNull(partitionManager);
+		this.bufferCompressor = bufferCompressor;
 		this.bufferPoolFactory = bufferPoolFactory;
 	}
 
@@ -144,12 +151,29 @@ public class ResultPartition implements ResultPartitionWriter, BufferPoolOwner {
 		partitionManager.registerResultPartition(this);
 	}
 
+	@Override
+	public void readRecoveredState(ChannelStateReader stateReader) throws IOException, InterruptedException {
+		for (ResultSubpartition subpartition : subpartitions) {
+			subpartition.readRecoveredState(stateReader);
+		}
+		LOG.debug("{}: Finished reading recovered state.", this);
+	}
+
 	public String getOwningTaskName() {
 		return owningTaskName;
 	}
 
 	public ResultPartitionID getPartitionId() {
 		return partitionId;
+	}
+
+	public int getPartitionIndex() {
+		return partitionIndex;
+	}
+
+	@Override
+	public ResultSubpartition getSubpartition(int subpartitionIndex) {
+		return subpartitions[subpartitionIndex];
 	}
 
 	@Override
@@ -183,14 +207,23 @@ public class ResultPartition implements ResultPartitionWriter, BufferPoolOwner {
 	// ------------------------------------------------------------------------
 
 	@Override
-	public BufferBuilder getBufferBuilder() throws IOException, InterruptedException {
+	public BufferBuilder getBufferBuilder(int targetChannel) throws IOException, InterruptedException {
 		checkInProduceState();
 
-		return bufferPool.requestBufferBuilderBlocking();
+		return bufferPool.requestBufferBuilderBlocking(targetChannel);
 	}
 
 	@Override
-	public boolean addBufferConsumer(BufferConsumer bufferConsumer, int subpartitionIndex) throws IOException {
+	public BufferBuilder tryGetBufferBuilder(int targetChannel) throws IOException {
+		BufferBuilder bufferBuilder = bufferPool.requestBufferBuilder(targetChannel);
+		return bufferBuilder;
+	}
+
+	@Override
+	public boolean addBufferConsumer(
+			BufferConsumer bufferConsumer,
+			int subpartitionIndex,
+			boolean isPriorityEvent) throws IOException {
 		checkNotNull(bufferConsumer);
 
 		ResultSubpartition subpartition;
@@ -203,7 +236,7 @@ public class ResultPartition implements ResultPartitionWriter, BufferPoolOwner {
 			throw ex;
 		}
 
-		return subpartition.add(bufferConsumer);
+		return subpartition.add(bufferConsumer, isPriorityEvent);
 	}
 
 	@Override
@@ -281,12 +314,8 @@ public class ResultPartition implements ResultPartitionWriter, BufferPoolOwner {
 	 * Returns the requested subpartition.
 	 */
 	public ResultSubpartitionView createSubpartitionView(int index, BufferAvailabilityListener availabilityListener) throws IOException {
-		int refCnt = pendingReferences.get();
-
-		checkState(refCnt != -1, "Partition released.");
-		checkState(refCnt > 0, "Partition not pinned.");
-
 		checkElementIndex(index, subpartitions.length, "Subpartition not found.");
+		checkState(!isReleased.get(), "Partition released.");
 
 		ResultSubpartitionView readView = subpartitions[index].createReadView(availabilityListener);
 
@@ -335,34 +364,17 @@ public class ResultPartition implements ResultPartitionWriter, BufferPoolOwner {
 	}
 
 	@Override
+	public CompletableFuture<?> getAvailableFuture() {
+		return bufferPool.getAvailableFuture();
+	}
+
+	@Override
 	public String toString() {
 		return "ResultPartition " + partitionId.toString() + " [" + partitionType + ", "
-				+ subpartitions.length + " subpartitions, "
-				+ pendingReferences + " pending references]";
+				+ subpartitions.length + " subpartitions]";
 	}
 
 	// ------------------------------------------------------------------------
-
-	/**
-	 * Pins the result partition.
-	 *
-	 * <p>The partition can only be released after each subpartition has been consumed once per pin
-	 * operation.
-	 */
-	void pin() {
-		while (true) {
-			int refCnt = pendingReferences.get();
-
-			if (refCnt >= 0) {
-				if (pendingReferences.compareAndSet(refCnt, refCnt + subpartitions.length)) {
-					break;
-				}
-			}
-			else {
-				throw new IllegalStateException("Released.");
-			}
-		}
-	}
 
 	/**
 	 * Notification when a subpartition is released.
@@ -373,17 +385,8 @@ public class ResultPartition implements ResultPartitionWriter, BufferPoolOwner {
 			return;
 		}
 
-		int refCnt = pendingReferences.decrementAndGet();
-
-		if (refCnt == 0) {
-			partitionManager.onConsumedPartition(this);
-		}
-		else if (refCnt < 0) {
-			throw new IllegalStateException("All references released.");
-		}
-
-		LOG.debug("{}: Received release notification for subpartition {} (reference count now at: {}).",
-				this, subpartitionIndex, pendingReferences);
+		LOG.debug("{}: Received release notification for subpartition {}.",
+				this, subpartitionIndex);
 	}
 
 	public ResultSubpartition[] getAllPartitions() {
